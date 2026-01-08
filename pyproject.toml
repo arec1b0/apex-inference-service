@@ -20,7 +20,8 @@ dependencies = [
     "mlflow>=2.10.0",
     "loguru>=0.7.2",
     "python-multipart>=0.0.9",
-    "slowapi>=0.1.9"
+    "slowapi>=0.1.9",
+    "pybreaker>=1.2.0"
 ]
 
 # Updated dependency group syntax to fix warning

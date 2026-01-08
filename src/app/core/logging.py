@@ -1,13 +1,18 @@
+"""Structured JSON logging with correlation."""
 import sys
-import logging
 import json
-from loguru import logger
+import logging
+from contextvars import ContextVar
+from loguru import logger as loguru_logger
 from src.app.core.config import settings
+
+# Context variable for trace_id
+trace_id: ContextVar[str] = ContextVar("trace_id", default="")
 
 class InterceptHandler(logging.Handler):
     def emit(self, record):
         try:
-            level = logger.level(record.levelname).name
+            level = loguru_logger.level(record.levelname).name
         except ValueError:
             level = record.levelno
 
@@ -16,44 +21,62 @@ class InterceptHandler(logging.Handler):
             frame = frame.f_back
             depth += 1
 
-        logger.opt(depth=depth, exception=record.exc_info).log(
+        loguru_logger.opt(depth=depth, exception=record.exc_info).log(
             level, record.getMessage()
         )
 
-def serialize(record):
-    subset = {
-        "timestamp": record["time"].isoformat(),
+def json_formatter(record):
+    """Format log record as JSON."""
+    log_entry = {
+        "timestamp": record["time"].strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "level": record["level"].name,
         "message": record["message"],
-        "logger": record["name"],
-        "module": record["module"],
+        "trace_id": trace_id.get() or "no-trace",
+        "service": "inference-api",
+        "module": record["name"],
         "function": record["function"],
         "line": record["line"],
-        "context": record["extra"],  # This captures correlation_id
-        "exception": record["exception"],
     }
-    return json.dumps(subset)
+    
+    # Add exception if present
+    if record["exception"]:
+        log_entry["exception"] = {
+            "type": str(record["exception"].type.__name__),
+            "value": str(record["exception"].value),
+        }
+    
+    # Add extra fields
+    if record["extra"]:
+        log_entry.update(record["extra"])
+    
+    return json.dumps(log_entry) + "\n"
 
 def setup_logging():
-    # Remove default handlers
-    logging.getLogger().handlers = []
-    
-    # Configuration
+    """Setup structured JSON logging."""
     log_level = "DEBUG" if settings.DEBUG else "INFO"
     
-    # Configure Loguru with JSON sink for Production
-    logger.configure(
-        handlers=[
-            {
-                "sink": sys.stdout, 
-                "level": log_level,
-                "serialize": True, # Native JSON serialization
-                # Or use custom: "format": "{message}", "sink": lambda msg: print(serialize(msg.record))
-            }
-        ]
-    )
+    # Remove default handler
+    loguru_logger.remove()
+    
+    # Add JSON handler for production
+    if settings.ENV == "production":
+        loguru_logger.add(
+            sys.stderr,
+            format=json_formatter,
+            level=log_level,
+            serialize=False,
+        )
+    else:
+        # Human-readable for dev
+        loguru_logger.add(
+            sys.stderr,
+            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+            level=log_level,
+        )
+    
+    # Intercept standard logging
+    logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+    for logger_name in ["uvicorn", "uvicorn.access", "uvicorn.error", "fastapi"]:
+        logging.getLogger(logger_name).handlers = [InterceptHandler()]
 
-    # Intercept standard library logging
-    logging.basicConfig(handlers=[InterceptHandler()], level=0)
-    logging.getLogger("uvicorn.access").handlers = [InterceptHandler()]
-    logging.getLogger("uvicorn.error").handlers = [InterceptHandler()]
+logger = loguru_logger

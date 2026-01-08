@@ -2,11 +2,13 @@ import joblib
 import os
 import asyncio
 import numpy as np
+import pybreaker
 from typing import Any, List, Tuple, Optional
 from loguru import logger
 from src.app.core.config import settings
 from src.app.services.base import ModelService
 from src.app.monitoring.metrics import MODEL_PREDICTION_COUNT, MODEL_CONFIDENCE
+from src.app.core.circuit_breaker import model_breaker
 
 class MLModelService(ModelService):
     def __init__(self):
@@ -32,11 +34,26 @@ class MLModelService(ModelService):
                 raise FileNotFoundError(f"Model not found at {settings.MODEL_PATH}")
 
     async def predict(self, input_data: List[float]) -> Tuple[Any, Optional[float]]:
-        """Returns (prediction, confidence)"""
+        """Returns (prediction, confidence) with circuit breaker protection."""
         async with self.semaphore:
             if self.model is None:
                 self.load()
-            return await asyncio.to_thread(self._predict_sync, input_data)
+            
+            try:
+                # Wrap in circuit breaker
+                prediction, confidence = await asyncio.to_thread(
+                    model_breaker.call, self._predict_sync, input_data
+                )
+                return prediction, confidence
+            except pybreaker.CircuitBreakerError:
+                logger.error("⚠️  Circuit breaker is OPEN, returning fallback")
+                # Record fallback metric
+                MODEL_PREDICTION_COUNT.labels(
+                    version=self.version,
+                    predicted_class="fallback",
+                ).inc()
+                # Return fallback prediction
+                return 0, 0.1  # Low confidence fallback
 
     def _predict_sync(self, input_data: List[float]) -> Tuple[Any, Optional[float]]:
         prediction = None

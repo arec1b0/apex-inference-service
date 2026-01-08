@@ -1,4 +1,5 @@
 import asyncio
+import signal
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from slowapi import _rate_limit_exceeded_handler
@@ -16,26 +17,37 @@ from src.app.monitoring.tracing import setup_tracing
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    """Startup/Shutdown lifecycle handler."""
     setup_logging()
-    logger.info("Starting up Apex Inference Service...")
-    try:
-        model_service.load()
-    except Exception:
-        pass
+    logger.info(" Starting inference service...")
+    model_service.load()
+    
+    # Register signal handlers
+    def shutdown_handler(signum, frame):
+        logger.warning(f" Received signal {signum}, initiating graceful shutdown...")
+        app.state.shutting_down = True
+    
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown_handler)
+    
+    logger.info(" Service ready")
     yield
-    # Shutdown
-    logger.info("Shutdown signal received. Cleanup initiated...")
-    await asyncio.sleep(1) 
-    logger.info("Cleanup complete.")
+    
+    # Graceful shutdown
+    logger.info(" Shutting down gracefully...")
+    await asyncio.sleep(5)  # Wait for inflight requests
+    logger.info(" Shutdown complete")
 
 def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.PROJECT_NAME,
         version=settings.VERSION,
-        lifespan=lifespan
+        lifespan=lifespan,
     )
-
+    
+    # Initialize shutting_down flag
+    app.state.shutting_down = False
+    
     # 1. Rate Limiting State
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
