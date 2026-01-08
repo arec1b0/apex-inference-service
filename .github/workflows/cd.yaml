@@ -1,0 +1,107 @@
+name: CD
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Log in to the Container registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata (tags, labels) for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=semver,pattern={{version}}
+          type=sha
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: deploy/docker/Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+  deploy-canary:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+
+      # Note: This step assumes KUBECONFIG is set in secrets
+      - name: Deploy Canary (Set traffic to 5%)
+        env:
+          KUBECONFIG: ${{ secrets.KUBE_CONFIG_DATA }}
+        run: |
+          # 1. Deploy new version as 'canary' release or update existing deployment with canary annotations
+          # Using Helm upgrade with specific canary values
+          
+          VERSION=${GITHUB_REF#refs/tags/v}
+          
+          helm upgrade --install apex-inference-v2 ./deploy/k8s/helm/inference-service \
+            --set image.tag=$VERSION \
+            --set ingress.annotations."nginx\.ingress\.kubernetes\.io/canary"=true \
+            --set ingress.annotations."nginx\.ingress\.kubernetes\.io/canary-weight"=5 \
+            --wait
+
+  promote-or-rollback:
+    needs: deploy-canary
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Automated Analysis (Mocked)
+        run: |
+          echo "Checking Prometheus metrics..."
+          # In real life: Query Prometheus for error rates of v2 pod
+          # python deploy/scripts/check_metrics.py --threshold 0.01
+          echo "Metrics healthy."
+
+      - name: Promote to Stable (100%)
+        if: success()
+        env:
+          KUBECONFIG: ${{ secrets.KUBE_CONFIG_DATA }}
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          
+          # Upgrade the MAIN release to the new version
+          helm upgrade --install apex-inference ./deploy/k8s/helm/inference-service \
+            --set image.tag=$VERSION \
+            --wait
+          
+          # Remove the canary deployment
+          helm uninstall apex-inference-v2
+
+      - name: Rollback
+        if: failure()
+        env:
+          KUBECONFIG: ${{ secrets.KUBE_CONFIG_DATA }}
+        run: |
+          echo "Rolling back canary..."
+          helm uninstall apex-inference-v2

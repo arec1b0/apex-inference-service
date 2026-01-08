@@ -1,0 +1,36 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    container_name: apex_api
+    ports:
+      - "8000:8000"
+    environment:
+      - ENV=dev
+      - LOG_LEVEL=DEBUG
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+    depends_on:
+      - jaeger
+      - prometheus
+    volumes:
+      # Mount model store for easy swapping of models during dev
+      - ./model_store:/app/model_store
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: apex_prometheus
+    volumes:
+      - ./deploy/docker/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: apex_jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686" # UI
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
