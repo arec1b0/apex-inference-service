@@ -1,0 +1,297 @@
+name: Deploy with Canary Validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to deploy'
+        required: true
+        default: 'latest'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      
+      - name: Run tests
+        run: |
+          pytest tests/ -v --cov=src/app
+      
+      - name: Run integration tests
+        run: |
+          pytest tests/integration/ -v
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Output image
+        id: image
+        run: |
+          echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}" >> $GITHUB_OUTPUT
+
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    environment: staging
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.12.0'
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+      
+      - name: Deploy to staging
+        run: |
+          helm upgrade --install apex-inference-staging ./charts/apex-inference \
+            --namespace staging \
+            --create-namespace \
+            --set image.repository=${{ needs.build.outputs.image }} \
+            --set image.tag=latest \
+            --set environment=staging \
+            --wait --timeout=10m
+      
+      - name: Run smoke tests
+        run: |
+          # Wait for deployment to be ready
+          kubectl wait --for=condition=available deployment/apex-inference-staging -n staging --timeout=300s
+          
+          # Run health checks
+          kubectl run smoke-test --image=curlimages/curl -i --restart=Never -- \
+            curl -f http://apex-inference-staging.staging.svc.cluster.local/health
+          
+          # Clean up
+          kubectl delete pod smoke-test
+
+  canary-validation:
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    environment: production
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install httpx asyncio
+      
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.12.0'
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+      
+      - name: Get current production version
+        id: production
+        run: |
+          VERSION=$(helm get values apex-inference -n production -o json | jq -r '.image.tag // "v1.0.0"')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Run canary validation
+        id: canary
+        run: |
+          export VERSION="${{ github.event.inputs.version || 'latest' }}"
+          export PRODUCTION_VERSION="${{ steps.production.outputs.version }}"
+          export VALUES_FILE="charts/apex-inference/values-canary.yaml"
+          export SLACK_WEBHOOK_URL="${{ secrets.SLACK_WEBHOOK_URL }}"
+          export PROMETHEUS_URL="http://prometheus.production.svc.cluster.local:9090"
+          export CI=true
+          
+          python examples/canary_validation_cicd.py
+        env:
+          KUBECONFIG: kubeconfig
+      
+      - name: Post-canary cleanup
+        if: always()
+        run: |
+          # Clean up any remaining canary deployment
+          helm delete apex-inference-canary -n production || true
+          
+          # Scale back production if needed
+          kubectl scale deployment apex-inference --replicas=3 -n production || true
+
+  promote-production:
+    needs: canary-validation
+    runs-on: ubuntu-latest
+    if: success() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    environment: production
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.12.0'
+      
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+      
+      - name: Promote to production
+        run: |
+          helm upgrade apex-inference ./charts/apex-inference \
+            --namespace production \
+            --reuse-values \
+            --set image.tag="${{ github.event.inputs.version || 'latest' }}" \
+            --set canary.enabled=false \
+            --wait --timeout=10m
+      
+      - name: Update deployment tag
+        run: |
+          # Tag the deployment in Git
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git tag -a "deploy-${{ github.event.inputs.version || 'latest' }}" -m "Deploy to production"
+          git push origin "deploy-${{ github.event.inputs.version || 'latest' }}"
+      
+      - name: Notify success
+        if: always()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"✅ Version ${{ github.event.inputs.version || 'latest' }} successfully deployed to production"}' \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+
+  rollback-production:
+    needs: canary-validation
+    runs-on: ubuntu-latest
+    if: failure() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    environment: production
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.12.0'
+      
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+      
+      - name: Rollback production
+        run: |
+          # Get last successful revision
+          REVISION=$(helm history apex-inference -n production | grep "deployed" | tail -n 2 | head -n 1 | awk '{print $1}')
+          
+          # Rollback to previous version
+          helm rollback apex-inference $REVISION -n production
+          
+          # Wait for rollback to complete
+          kubectl rollout status deployment/apex-inference -n production --timeout=300s
+      
+      - name: Notify rollback
+        if: always()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"🚨 Production rollback triggered due to canary validation failure"}' \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+      
+      - name: Create issue for investigation
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Production rollback - Canary validation failed',
+              body: 'Automated rollback triggered during deployment of version ${{ github.event.inputs.version || latest }}.\n\nPlease investigate the performance regression.\n\nWorkflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
+              labels: ['bug', 'urgent', 'production']
+            })
