@@ -27,6 +27,8 @@ COPY --from=builder /app/.venv /app/.venv
 # Copy application code
 COPY src /app/src
 COPY pyproject.toml /app/
+# --- NEW LINE HERE ---
+COPY model_store /app/model_store
 
 # Set environment path
 ENV PATH="/app/.venv/bin:$PATH"
