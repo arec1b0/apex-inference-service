@@ -1,15 +1,18 @@
 import joblib
 import os
-import random
-from typing import Any, List
+import asyncio
+import numpy as np
+from typing import Any, List, Tuple, Optional
 from loguru import logger
 from src.app.core.config import settings
 from src.app.services.base import ModelService
+from src.app.monitoring.metrics import MODEL_PREDICTION_COUNT, MODEL_CONFIDENCE
 
 class MLModelService(ModelService):
     def __init__(self):
         self.model = None
         self.version = settings.VERSION
+        self.semaphore = asyncio.Semaphore(5)
 
     def load(self) -> None:
         logger.info(f"Loading model from {settings.MODEL_PATH}...")
@@ -22,28 +25,68 @@ class MLModelService(ModelService):
                 raise RuntimeError(f"Could not load model at {settings.MODEL_PATH}")
         else:
             if settings.DEBUG:
-                logger.warning(f"Model file not found at {settings.MODEL_PATH}. Using DUMMY model for dev/testing.")
+                logger.warning(f"Model file not found at {settings.MODEL_PATH}. Using DUMMY model.")
                 self.model = "DUMMY"
             else:
-                logger.critical(f"Model file missing at {settings.MODEL_PATH} in non-debug mode.")
+                logger.critical(f"Model file missing at {settings.MODEL_PATH}.")
                 raise FileNotFoundError(f"Model not found at {settings.MODEL_PATH}")
 
-    def predict(self, input_data: List[float]) -> Any:
-        if self.model is None:
-            self.load()
+    async def predict(self, input_data: List[float]) -> Tuple[Any, Optional[float]]:
+        """Returns (prediction, confidence)"""
+        async with self.semaphore:
+            if self.model is None:
+                self.load()
+            return await asyncio.to_thread(self._predict_sync, input_data)
+
+    def _predict_sync(self, input_data: List[float]) -> Tuple[Any, Optional[float]]:
+        prediction = None
+        confidence = None
         
+        # 1. Dummy Model Logic
         if self.model == "DUMMY":
-            # Simulate prediction for testing infrastructure before training
-            return 1 if sum(input_data) > 0.5 else 0
+            score = sum(input_data)
+            prediction = 1 if score > 0.5 else 0
+            # Fake confidence for dummy model
+            confidence = min(max(abs(score - 0.5) + 0.5, 0.5), 1.0) 
+        
+        # 2. Sklearn Model Logic
+        else:
+            try:
+                # Get the class prediction
+                pred_array = self.model.predict([input_data])
+                prediction = pred_array[0]
+                
+                # Get confidence (probability) if available
+                if hasattr(self.model, "predict_proba"):
+                    proba = self.model.predict_proba([input_data])
+                    # Take the max probability as "confidence"
+                    confidence = float(np.max(proba))
+                else:
+                    confidence = 1.0 # Fallback if model doesn't support probabilities
+                    
+            except Exception as e:
+                logger.error(f"Prediction error: {e}")
+                raise
 
-        # Scikit-learn prediction
+        # 3. Record Metrics
         try:
-            # Reshape for single sample prediction: [n_features] -> [1, n_features]
-            prediction = self.model.predict([input_data])
-            return prediction[0]
+            # Cast prediction to string for label
+            pred_label = str(prediction)
+            
+            MODEL_PREDICTION_COUNT.labels(
+                version=self.version, 
+                predicted_class=pred_label
+            ).inc()
+            
+            if confidence is not None:
+                MODEL_CONFIDENCE.labels(
+                    version=self.version
+                ).observe(confidence)
+                
         except Exception as e:
-            logger.error(f"Prediction error: {e}")
-            raise
+            logger.error(f"Error recording metrics: {e}")
+            # Don't fail the request just because metrics failed
 
-# Global instance
+        return prediction, confidence
+
 model_service = MLModelService()

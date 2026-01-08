@@ -1,25 +1,30 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Request
 from loguru import logger
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from src.app.models.schemas import PredictionRequest, PredictionResponse
 from src.app.services.model_wrapper import model_service
 from src.app.core.config import settings
+from src.app.core.limiter import limiter
 
 router = APIRouter()
 
 @router.post("/predict", response_model=PredictionResponse)
-async def predict(request: PredictionRequest):
-    logger.info(f"Received prediction request: {request.id}")
+@limiter.limit("100/minute")
+async def predict(request: Request, body: PredictionRequest):
+    # Log context with JSON structure automatically via Loguru serialization
+    logger.info(f"Prediction request received", extra={"request_id": body.id})
     
     try:
-        result = model_service.predict(request.features)
+        # Unpack tuple: (result, probability)
+        result, probability = await model_service.predict(body.features)
         
-        # In a real scenario, we might return probability too if the model supports it
         return PredictionResponse(
-            id=request.id,
+            id=body.id,
             prediction=result,
-            probability=None, # Update if using predict_proba
+            probability=probability,
             model_version=settings.VERSION
         )
     except Exception as e:
-        logger.error(f"Error processing request {request.id}: {e}")
+        logger.error(f"Prediction failed: {e}", extra={"request_id": body.id})
         raise HTTPException(status_code=500, detail="Internal prediction error")

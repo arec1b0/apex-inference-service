@@ -4,7 +4,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 from fastapi import Request, Response
 
-# Define Metrics
+# --- Infrastructure Metrics ---
 REQUEST_COUNT = Counter(
     "http_requests_total", 
     "Total number of HTTP requests", 
@@ -17,10 +17,18 @@ REQUEST_LATENCY = Histogram(
     ["method", "endpoint"]
 )
 
+# --- Model Quality Metrics ---
 MODEL_PREDICTION_COUNT = Counter(
     "model_prediction_total",
     "Total number of model predictions",
-    ["version"]
+    ["version", "predicted_class"]
+)
+
+MODEL_CONFIDENCE = Histogram(
+    "model_prediction_confidence",
+    "Model confidence score (probability) distribution",
+    ["version"],
+    buckets=[0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0]
 )
 
 class PrometheusMiddleware(BaseHTTPMiddleware):
@@ -29,8 +37,6 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         start_time = time.time()
-        
-        # Process request
         try:
             response = await call_next(request)
             status_code = response.status_code
@@ -39,15 +45,12 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
             raise
         finally:
             process_time = time.time() - start_time
-            
-            # Record metrics (skip health checks to reduce noise)
             if "/health" not in request.url.path and "/metrics" not in request.url.path:
                 REQUEST_COUNT.labels(
                     method=request.method,
                     endpoint=request.url.path,
                     status_code=status_code
                 ).inc()
-                
                 REQUEST_LATENCY.labels(
                     method=request.method,
                     endpoint=request.url.path
@@ -55,6 +58,5 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
 
         return response
 
-def metrics_endpoint():
-    """Endpoint for Prometheus scraping."""
+def metrics_endpoint(request: Request):
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
