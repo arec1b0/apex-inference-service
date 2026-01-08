@@ -4,11 +4,25 @@ import json
 import logging
 from contextvars import ContextVar
 from loguru import logger as loguru_logger
+from opentelemetry import trace
 
 from src.app.core.config import settings
 
 # Context variable for trace_id (thread-safe)
 trace_id: ContextVar[str] = ContextVar("trace_id", default="")
+
+
+def get_trace_id() -> str:
+    """Get trace ID from OpenTelemetry context or fallback to manual trace_id."""
+    # Try to get from OpenTelemetry span
+    span = trace.get_current_span()
+    if span and span.is_recording():
+        span_context = span.get_span_context()
+        if span_context.is_valid:
+            return format(span_context.trace_id, "032x")
+    
+    # Fallback to manual trace_id
+    return trace_id.get() or "no-trace"
 
 
 class InterceptHandler(logging.Handler):
@@ -33,12 +47,15 @@ class InterceptHandler(logging.Handler):
 
 
 def json_formatter(record):
-    """Format loguru record as JSON."""
+    """Format loguru record as JSON with OpenTelemetry trace context."""
+    # Get trace_id from OpenTelemetry or fallback
+    current_trace_id = get_trace_id()
+    
     log_entry = {
         "timestamp": record["time"].strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "level": record["level"].name,
         "message": record["message"],
-        "trace_id": trace_id.get() or "no-trace",
+        "trace_id": current_trace_id,
         "service": "inference-api",
         "module": record["name"],
         "function": record["function"],

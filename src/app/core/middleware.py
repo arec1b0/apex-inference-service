@@ -5,7 +5,9 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from loguru import logger
+
 from src.app.core.logging import trace_id as trace_id_var
+from src.app.monitoring.tracing import get_current_span, set_span_attributes
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -28,6 +30,16 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         # Set trace_id in context for logging
         trace_id_var.set(correlation_id)
         
+        # Link correlation ID to OpenTelemetry span
+        span = get_current_span()
+        if span:
+            set_span_attributes(
+                span,
+                correlation_id=correlation_id,
+                http_method=request.method,
+                http_url=str(request.url),
+            )
+        
         # Store in request state
         request.state.correlation_id = correlation_id
         request.state.start_time = start_time
@@ -40,6 +52,14 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
             process_time = time.time() - start_time
+            
+            # Add span attributes for response
+            if span:
+                set_span_attributes(
+                    span,
+                    http_status_code=response.status_code,
+                    http_response_time_ms=round(process_time * 1000, 2),
+                )
             
             logger.info(
                 f"✅ {request.method} {request.url.path} → {response.status_code}",
@@ -61,4 +81,8 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                 f"❌ {request.method} {request.url.path} failed: {e}",
                 extra={"correlation_id": correlation_id}
             )
+            # Record exception in span
+            if span:
+                from src.app.monitoring.tracing import record_exception
+                record_exception(span, e)
             raise
